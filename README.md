@@ -90,25 +90,67 @@ def vuln(input=input('Your address: ')):
 
 vuln()
 
- ```
- For Tree-of-AST perspective
+```
 
- ```
-    Tree-of-AST of os.system(user_input):
+## Thought To Reality
+### Setting up AST nods
+Think might be easier than doing, but in this case both is hard. To turn our ideal model in to reality acutally took lots of efforts. To begin with, we started on buiding a `source-to-sink` alike framework using Python AST with reverse-tracking. However, the AST do not support direct reverse-traveling, thus we will have to assign each node with a `fwd`, `bck` and `id` similar to glibc bidirectional linked list in dynamic memory allocation; while adding `parents` and `children` to remain the tree property of our AST.
 
-        TOP: input=input('Your address: ')
-         1-: user_input = user_input.split(',')
-         2-: user_input = user_input[3]
-         3-: if not 'retr0reg' in user_input:\n exit()
-         4-: user_input = user_input.split('love')[1] 
-       TAIL: os.system(user_input)
+```python
+lass ToAfy(ast.NodeVisitor):
+    
+    """ Adding father and children attribution to every node so we can reverse travel the AST """
+    
+    def __init__(self, target_function=None, target_variable=None):
+        self.parent = None
+        self.last_id = 0
+        self.last_node = None
+        self.target_function = target_function
+        self.target_variable = target_variable
+        self.vulnerable_note = None
 
-    EXPLOITING TAIL->HEAD：
-    TAIL:  # ANALYSIS-TAIL: <arbitrary>love<COMMAND>
-       4:  # ANALYSIS: <arbitrary>retr0reglove<COMMAND> or retr0reg<arbitrary>love<COMMAND>
-       3:  # ANALYSIS: <arbitrary>retr0reglove<COMMAND>, or retr0reg<arbitrary>love<COMMAND>
-       2:
-       1:
-    HEAD: 
+        
+    def generic_visit(self, node):
+        node.node_id = self.last_id
+        self.last_id += 1
 
- ```
+        # print(f'setting {node.id}')
+        
+        if self.last_node is not None:
+            self.last_node.fwd = node
+            node.bck = self.last_node
+        else:
+            node.bck = None
+            
+        node.fwd = None
+        self.last_node = node
+        # if node.bck and self.last_node:
+        #     print(f'{node.id}: last_node\'s fwd {self.last_node.id}, note\'s bck {node.bck.id}')
+        
+        if not hasattr(node, 'parent'):
+            node.parent = self.parent
+        if not hasattr(node, 'children'):
+            node.children = []
+```
+
+Additionally, we will have to locate the node that's representing our vulnerable code segment. this usually takes other round of positive directional traveling, nevertheless,  if we sets the `fwd`, `bck`, `id` while try locating that vulnerability sink, we can manage to use only once of positive directional traveling of the AST.
+
+```python
+    if isinstance(node, ast.Call):
+            full_function_name = get_full_function_name(node.func)
+            if full_function_name == self.target_function:
+                for arg in node.args:
+                    if isinstance(arg, ast.Name) and arg.id == self.target_variable:
+                        # VULN
+                        self.vulnerable_note = node
+```
+Finally wrap up setting parent nodes.
+```python
+        self.parent = node
+        current_last_node = self.last_node
+        for child in ast.iter_child_nodes(node):
+            node.children.append(child)
+            self.visit(child)
+        self.last_node = current_last_node 
+        ## RESTORING self.last_node
+```
