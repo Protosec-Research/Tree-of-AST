@@ -4,27 +4,25 @@ import typing as t
 
 ASTDumps = str
 
-class NoAsType(BaseModel): 
-    class ops:
-        des: str
-        ops: str
-        src: ASTDumps
+# class NoAsType(BaseModel): 
+#     class ops:
+#         src: str
+#         des: str
+#         ops: ASTDumps
         
-    class statement:
-        details: ASTDumps
+#     class statement:
+#         details: ASTDumps
         
-    class input:
-        des: str
-        input
+#     class input:
+#         des: str
         
-
 
 class NoA(BaseModel):
     """
     NoA: Note of Tree-of-Ast
     """
     name: str
-    details: NoAsType
+    details: ASTDumps
     children: t.List['NoA'] = []
 
     # Method to add a child node to the current node
