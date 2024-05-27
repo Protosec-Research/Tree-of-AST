@@ -97,7 +97,7 @@ vuln()
 Think might be easier than doing, but in this case both is hard. To turn our ideal model in to reality acutally took lots of efforts. To begin with, we started on buiding a `source-to-sink` alike framework using Python AST with reverse-tracking. However, the AST do not support direct reverse-traveling, thus we will have to assign each node with a `fwd`, `bck` and `id` similar to glibc bidirectional linked list in dynamic memory allocation; while adding `parents` and `children` to remain the tree property of our AST.
 
 ```python
-lass ToAfy(ast.NodeVisitor):
+class ToAfy(ast.NodeVisitor):
     
     """ Adding father and children attribution to every node so we can reverse travel the AST """
     
