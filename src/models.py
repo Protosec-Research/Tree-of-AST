@@ -1,122 +1,221 @@
+import warnings
+import os
+from langchain.globals import set_debug
 import ast
-from _console import cons
-from _types import *
+import astor
+from typing import List, Dict, Any, Tuple
+from langchain_community.chat_models import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate, HumanMessagePromptTemplate
+from langchain.chains import LLMChain
+from langchain.output_parsers import PydanticOutputParser
+from pydantic import BaseModel, Field
+from langchain.prompts.chat import SystemMessagePromptTemplate
+from dotenv import load_dotenv
 
-print = cons.print
+load_dotenv()
 
-def get_full_function_name(node):
-    """构造函数的完整名称，例如 'os.system'"""
-    if isinstance(node, ast.Attribute):
-        return get_full_function_name(node.value) + '.' + node.attr
-    elif isinstance(node, ast.Name):
-        return node.id
-    return ""
+# Add the following code at the beginning of the file
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+set_debug(False)
 
-class ToAfy(ast.NodeVisitor):
-    
-    """ Adding father and children attribution to every node so we can reverse travel the AST """
-    
-    def __init__(self, target_function=None, target_variable=None):
-        self.parent = None
-        self.last_id = 0
-        self.last_node = None
-        self.target_function = target_function
-        self.target_variable = target_variable
-        self.vulnerable_note = None
+class ToA:
+    def __init__(self, code: str):
+        self.tree = ast.parse(code)
+        self.__add_parent_info(self.tree)
+        self.code = code
+        self.sinks = ['eval', 'exec', 'os.system', '']
+        self.call_graph = {}
+        self.variable_sources = {}
+        self.function_defs = {}
+        self.function_callers = {}
+        
+        self.chat_model = ChatOpenAI(
+            base_url="https://ai-yyds.com/v1",
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            model="gpt-4o",
+        )
+        
+        class Probabilities(BaseModel):
+            probabilities: Dict[str, float] = Field(description="Probabilities of each caller causing user-controllable input source")
 
+        self.output_parser = PydanticOutputParser(pydantic_object=Probabilities)
         
-    def generic_visit(self, node):
-        # 为节点设置全局唯一ID
-        node.node_id = self.last_id
-        self.last_id += 1
+        system_message_prompt = SystemMessagePromptTemplate.from_template(
+            "You are a code analysis expert, specializing in analyzing function call relationships and potential user input sources. "
+            "Please strictly output in the specified JSON format without any additional explanations or comments."
+        )
+        human_message_prompt = HumanMessagePromptTemplate.from_template(
+            "Given the function '{function_name}' and its potential callers {callers}, evaluate the probability of each caller causing a user-controllable input source."
+            "Carefully analyze the implementation of each caller function:"
+            "1. If a function uses hardcoded values or constants, it should be considered a low probability source of user-controllable input."
+            "2. If a function directly uses user input (e.g., input() function), it should be considered a high probability source of user-controllable input."
+            "3. If a function receives values from parameters, consider the possible sources of these parameters."
+            "5. Functions that don't directly handle user input or only call other functions should generally have lower probabilities."
+            "The sum of all probabilities should equal 1. Avoid extreme high or low probabilities; provide reasonable estimates."
+            "Consider the following code context:\n\n{code_context}\n\n"
+            "Output in the following format:\n{format_instructions}"
+        )
+        self.vote_prompt = ChatPromptTemplate.from_messages([
+            system_message_prompt,
+            human_message_prompt
+        ])
+        self.vote_chain = LLMChain(llm=self.chat_model, prompt=self.vote_prompt)
 
-        # print(f'setting {node.id}')
-        
-        if self.last_node is not None:
-            self.last_node.fwd = node
-            node.bck = self.last_node
-        else:
-            node.bck = None
-            
-        node.fwd = None
-        # 更新last_node为当前节点
-        self.last_node = node
-        # if node.bck and self.last_node:
-        #     print(f'{node.id}: last_node\'s fwd {self.last_node.id}, note\'s bck {node.bck.id}')
-        
-        # 设置父节点和子节点列表
-        if not hasattr(node, 'parent'):
-            node.parent = self.parent
-        if not hasattr(node, 'children'):
-            node.children = []
-        
-        # 检查是否是目标函数调用
-        if isinstance(node, ast.Call):
-            full_function_name = get_full_function_name(node.func)
-            if full_function_name == self.target_function:
-                for arg in node.args:
-                    if isinstance(arg, ast.Name) and arg.id == self.target_variable:
-                        # 记录漏洞点
-                        self.vulnerable_note = node
-        
-        # 设置父节点并递归访问子节点
-        original_parent = self.parent
-        self.parent = node
-        current_last_node = self.last_node
+    def __add_parent_info(self, node, parent=None):
+        node.parent = parent
         for child in ast.iter_child_nodes(node):
-            node.children.append(child)
-            self.visit(child)
-        self.last_node = current_last_node  # 恢复last_node的状态
+            self.__add_parent_info(child, node)
 
-        
-        
+    def __build_call_graph(self):
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.FunctionDef):
+                self.function_defs[node.name] = node
+                self.call_graph[node.name] = []
+            elif isinstance(node, ast.Call):
+                func_name = self.__get_func_name(node)
+                caller_func = self.__get_enclosing_function(node)
+                if func_name and caller_func:
+                    if caller_func not in self.call_graph:
+                        self.call_graph[caller_func] = []
+                    self.call_graph[caller_func].append(func_name)
+                    if func_name not in self.function_callers:
+                        self.function_callers[func_name] = []
+                    self.function_callers[func_name].append(caller_func)
+            elif isinstance(node, ast.Assign):
+                targets = [target.id for target in node.targets if isinstance(target, ast.Name)]
+                value = self.__get_source(node.value)
+                for target in targets:
+                    self.variable_sources[target] = value
 
-class VariableTrace(ast.NodeVisitor):
-    
-    def __init__(self,root_note,target_variable):
-        self.root_note = root_note
-        self.target_variable = target_variable
-        self.target_tree = []   # Variable change tree
-        self.visited = set()    # Make sure no double-visite
-        
-    def reverse_trace_from_node(self):
-        """
-        从给定的节点逆向追溯到变量的源头。
-        """
-        current_node = self.root_note
-        while current_node.node_id != 0 and getattr(current_node, 'fwd', None):
-            # 处理当前节点的逻辑...
-            if isinstance(current_node, ast.Assign):
-                for target in current_node.targets:
-                    # print(f"[!] target: {self.target_variable}" )
-                    if isinstance(target, ast.Name) and target.id == self.target_variable:
-                        self.target_tree.append(('Assign', current_node, current_node.node_id))
-                        value = current_node.value
-                        if isinstance(value, ast.Name):
-                            # 直接变量赋值
-                            self.target_variable = value.id
-                            self.target_tree.append(('UpdateTargetAssign', value.id))
-                        elif isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name):
-                            # 切片操作或索引访问
-                            self.target_variable = value.value.id
-                            self.target_tree.append(('UpdateTargetSlice', value.value.id))
-                            
-                        elif isinstance(value, ast.Call):
-                            # 处理函数调用
-                            func_name = get_full_function_name(value.func)
-                            self.target_variable = value.func.value.id
-                            call_info = f"{func_name}({', '.join(ast.dump(arg) for arg in value.args)})"
-                            self.target_tree.append(('UpdateTargetCall', call_info))
-                            
-                # 追踪赋值右侧的表达式
-            elif isinstance(current_node, ast.If):
-                # 如果是一个决策点
-                self.target_tree.append(('If', current_node, current_node.node_id))
+    def __get_func_name(self, node):
+        if isinstance(node.func, ast.Name):
+            return node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Name):
+                return f"{node.func.value.id}.{node.func.attr}"
+            else:
+                return node.func.attr
+        else:
+            return None
 
-            # 移动到父节点
-            # current_node = getattr(current_node, 'parent', None)
-            # print(f"    [*] Current note_id: {current_node.id}")
-            # print(f"    [*] fwd: {current_node.fwd.id}; bck: {current_node.bck.id}")
-            current_node = current_node.bck
+    def __get_enclosing_function(self, node):
+        while node:
+            if isinstance(node.parent, ast.FunctionDef):
+                return node.parent.name
+            node = node.parent
+        return "global"
+
+    def __get_call_info(self, node: ast.Call) -> Dict[str, Any]:
+        func_name = self.__get_func_name(node)
+        if not func_name:
+            return None
+        args_info = []
+        for arg in node.args:
+            arg_source = self.__get_source(arg)
+            args_info.append(arg_source)
+        return {
+            'func': func_name,
+            'args': args_info
+        }
+
+    def __get_source(self, node):
+        if isinstance(node, ast.Name):
+            var_name = node.id
+            if var_name in self.variable_sources:
+                return {var_name: self.variable_sources[var_name]}
+            else:
+                return var_name
+        elif isinstance(node, ast.Call):
+            return self.__get_call_info(node)
+        elif isinstance(node, ast.Constant):
+            return node.value
+        else:
+            return astor.to_source(node).strip()
+
+    def __trace_variable_source(self, var):
+        if isinstance(var, dict):
+            for var_name, source in var.items():
+                print(f"Variable '{var_name}' originates from:")
+                self.__trace_variable_source(source)
+        else:
+            print(f"    {var}")
+
+    def __get_code_context(self, func_name, callers):
+        context = f"Function {func_name} definition:\n"
+        if func_name in self.function_defs:
+            context += astor.to_source(self.function_defs[func_name]) + "\n\n"
+        context += "Caller functions tree:\n"
+        for caller in callers:
+            context += self.__get_caller_tree(caller, 0, max_depth=2)
+        return context
+
+    def __get_caller_tree(self, func_name, depth, max_depth=2):
+        tree = "  " * depth + f"- {func_name}\n"
+        if func_name in self.function_defs:
+            tree += "  " * (depth + 1) + astor.to_source(self.function_defs[func_name]).replace("\n", "\n" + "  " * (depth + 1)) + "\n"
+        
+        if depth < max_depth and func_name in self.function_callers:
+            for caller in self.function_callers[func_name]:
+                tree += self.__get_caller_tree(caller, depth + 1, max_depth)
+        
+        return tree
+
+    def TRACE(self, func_name, path):
+        if func_name in self.function_callers:
+            voted_caller = self.VOTE(func_name)
+            if voted_caller and voted_caller not in path:
+                path.append(voted_caller)
+                self.TRACE(voted_caller, path)
+            else:
+                print("Possible function call chain: " + " ← ".join(reversed(path)))
+        else:
+            print("Possible function call chain: " + " ← ".join(reversed(path)))
+
+    def VOTE(self, func_name):
+        callers = self.function_callers.get(func_name, [])
+        if callers:
+            code_context = self.__get_code_context(func_name, callers)
             
-        return self.target_tree
+            format_instructions = self.output_parser.get_format_instructions()
+            
+            response = self.vote_chain.run(
+                function_name=func_name, 
+                callers=callers, 
+                code_context=code_context,
+                format_instructions=format_instructions
+            )
+            
+            try:
+                parsed_output = self.output_parser.parse(response)
+                probabilities = parsed_output.probabilities
+                print(f"VOTE: {probabilities}")
+                if probabilities:
+                    return max(probabilities, key=probabilities.get)
+            except Exception as e:
+                print(f"ERROR (VOTE): {response}")
+                print(f"{str(e)}")
+            
+            return callers[0]
+        else:
+            return None
+    
+    def LOCATE(self, node: ast.Call) -> bool:
+        func_name = self.__get_func_name(node)
+        if func_name in self.sinks:
+            return True
+        return False 
+
+    def analyze(self):
+        self.__build_call_graph()
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Call) and self.LOCATE(node):
+                sink_info = self.__get_call_info(node)
+                print(f"Dangerous function call found: {sink_info['func']}")
+                print(f"Starting backward tracing from '{sink_info['func']}':")
+                self.TRACE(sink_info['func'], [sink_info['func']])
+
+# Usage example
+if __name__ == "__main__":
+    code = open('vuln/sagemaker.py', 'r').read()
+    analyzer = ToA(code)
+    analyzer.analyze()
