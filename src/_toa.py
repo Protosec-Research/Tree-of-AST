@@ -3,6 +3,7 @@ import os
 from langchain.globals import set_debug
 import ast
 import astor
+import json
 from typing import List, Dict, Any, Tuple, Optional
 from langchain_community.chat_models import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate, HumanMessagePromptTemplate
@@ -18,9 +19,11 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 set_debug(False)
 
 class VariableNode:
-    def __init__(self, value: Any, description: str):
+    def __init__(self, value: Any, description: str, condition: Optional[str] = None, index: int = 0):
         self.value = value
         self.description = description
+        self.condition = condition  # New attribute to store condition
+        self.index = index  # New attribute for numbering
         self.prev: Optional[VariableNode] = None
         self.next: Optional[VariableNode] = None
 
@@ -28,9 +31,11 @@ class VariableTrace:
     def __init__(self):
         self.head: Optional[VariableNode] = None
         self.tail: Optional[VariableNode] = None
+        self.counter = 0  # Counter for numbering
 
-    def add_node(self, value: Any, description: str):
-        new_node = VariableNode(value, description)
+    def add_node(self, value: Any, description: str, condition: Optional[str] = None):
+        self.counter += 1
+        new_node = VariableNode(value, description, condition, self.counter)
         if not self.head:
             self.head = self.tail = new_node
         else:
@@ -44,13 +49,14 @@ class ToA:
         self.__add_parent_info(self.tree)
         self.code = code
         self.sinks = sinks
-        self.tainted_variables = set()  # Changed from list to set
+        self.tainted_variables = set() 
         self.call_graph = {}
         self.variable_sources = {}
         self.function_defs = {}
         self.function_callers = {}
         self.variable_traces: Dict[str, VariableTrace] = {}
         self.call_chain = []
+        self.conditions = []  # New attribute to keep track of conditions
         
         self.chat_model = ChatOpenAI(
             base_url="https://ai-yyds.com/v1",
@@ -89,8 +95,28 @@ class ToA:
         for child in ast.iter_child_nodes(node):
             self.__add_parent_info(child, node)
 
+    # New method to analyze conditionals
+    def __analyze_conditions(self, node):
+        if isinstance(node, ast.If):
+            condition = astor.to_source(node.test).strip()
+            self.conditions.append(condition)
+            # Trace the condition as part of variable tracing
+            self.__trace_variable_source(condition, "condition", condition)
+            # Recursively analyze the body and orelse parts
+            for body_node in node.body:
+                self.__analyze_conditions(body_node)
+            for orelse_node in node.orelse:
+                self.__analyze_conditions(orelse_node)
+            self.conditions.pop()
+        else:
+            # Continue traversing for other node types
+            for child in ast.iter_child_nodes(node):
+                self.__analyze_conditions(child)
+
     def __build_call_graph(self):
         for node in ast.walk(self.tree):
+            if isinstance(node, ast.If):
+                self.__analyze_conditions(node)
             if isinstance(node, ast.FunctionDef):
                 self.function_defs[node.name] = node
                 self.call_graph[node.name] = []
@@ -105,28 +131,32 @@ class ToA:
                         self.function_callers[func_name] = []
                     self.function_callers[func_name].append(caller_func)
                 
-                # 只追踪污点函数的参数
+                # Only trace tainted sink functions' arguments
                 if func_name in self.sinks:
                     for i, arg in enumerate(node.args):
                         arg_source = self.__get_source(arg)
                         self.__trace_variable_source(arg_source, f"{func_name}_arg_{i}")
-                        self.tainted_variables.add(frozenset(arg_source.items()))  # 将字典转换为frozenset后添加
+                        if isinstance(arg_source, dict):
+                            self.tainted_variables.add(frozenset(arg_source.items()))
+                        elif isinstance(arg_source, str):
+                            self.tainted_variables.add(frozenset([(arg_source, None)]))
+                        else:
+                            raise TypeError(f"Unexpected type for arg_source: {type(arg_source)}")
 
             elif isinstance(node, ast.Assign):
                 targets = [target.id for target in node.targets if isinstance(target, ast.Name)]
                 value = self.__get_source(node.value)
+                current_condition = self.conditions[-1] if self.conditions else None
                 for target in targets:
                     self.variable_sources[target] = value
                     if isinstance(value, dict):
-                        # 如果value是字典,检查它的某个特定键是否在tainted_variables中
                         if any(key in self.tainted_variables for key in value):
-                            # 处理污染逻辑
-                            pass
-                    elif value in self.tainted_variables:
-                        # 原有的检查逻辑
-                        pass
-                    self.__trace_variable_source(value, target)
-                    self.tainted_variables.add(target)
+                            self.tainted_variables.add(target)
+                    elif isinstance(value, str) and value in self.tainted_variables:
+                        self.tainted_variables.add(target)
+                    elif isinstance(value, dict) and any(v in self.tainted_variables for v in value.values()):
+                        self.tainted_variables.add(target)
+                    self.__trace_variable_source(value, target, current_condition)
 
     def __get_func_name(self, node):
         if isinstance(node.func, ast.Name):
@@ -172,17 +202,41 @@ class ToA:
             return call_info
         elif isinstance(node, ast.Constant):
             return node.value
+        elif isinstance(node, ast.Subscript):
+            # Handle slicing operations
+            value = self.__get_source(node.value)
+            slice_info = self.__get_source(node.slice)
+            return f"{value}[{slice_info}]"
+        elif isinstance(node, ast.Attribute):
+            value = self.__get_source(node.value)
+            return f"{value}.{node.attr}"
+        elif isinstance(node, ast.BinOp):
+            left = self.__get_source(node.left)
+            right = self.__get_source(node.right)
+            op = self.__get_operator(node.op)
+            return f"({left} {op} {right})"
         else:
             return astor.to_source(node).strip()
 
-    def __trace_variable_source(self, var, var_name=None):
+    def __get_operator(self, op):
+        if isinstance(op, ast.Add):
+            return '+'
+        elif isinstance(op, ast.Sub):
+            return '-'
+        elif isinstance(op, ast.Mult):
+            return '*'
+        elif isinstance(op, ast.Div):
+            return '/'
+        else:
+            return 'op'
+
+    def __trace_variable_source(self, var, var_name=None, condition: Optional[str] = None):
         main_var_name = var_name.split('.')[0] if var_name else 'unknown'
         if main_var_name not in self.variable_traces:
             self.variable_traces[main_var_name] = VariableTrace()
         
         description = f"{var_name}: {var}"
-        self.variable_traces[main_var_name].add_node(var, description)
-        print(f"[!] {description}")
+        self.variable_traces[main_var_name].add_node(var, description, condition)
 
     def __get_code_context(self, func_name, callers):
         context = f"Function {func_name} definition:\n"
@@ -265,11 +319,11 @@ class ToA:
         value_scores = {}
         for caller in callers:
             remaining_chain, chain_length = self.__get_remaining_chain(caller)
-            value_scores[caller] = chain_length  # 剩余调用链越长，分数越高
+            value_scores[caller] = chain_length  
             print(f"\t\t{caller}: {chain_length}")
             print(f"\t\t\tChain: {' -> '.join(remaining_chain)}")
         
-        # 归一化分数
+        # Normalize scores
         total_score = sum(value_scores.values())
         return {caller: score/total_score for caller, score in value_scores.items()}
 
@@ -317,25 +371,33 @@ class ToA:
                         if var_name not in traced_vars:
                             traced_vars.add(var_name)
                             source = self.__get_source(node.value)
-                            self.__trace_variable_source(source, var_name)
+                            current_condition = self.conditions[-1] if self.conditions else None
+                            self.__trace_variable_source(source, var_name, current_condition)
 
     def print_variable_traces(self):
         for var_name, trace in self.variable_traces.items():
             print(f"\nVariable: {var_name}")
+            # Collect nodes into a list to sort
+            nodes = []
             current = trace.head
             while current:
-                print(f"  {current.description}")
+                nodes.append(current)
                 current = current.next
+            # Sort nodes based on index
+            nodes.sort(key=lambda node: node.index)
+            # Print nodes in order
+            for node in nodes:
+                if node.condition:
+                    print(f"  [{node.index}] [Condition: {node.condition}] {node.description}")
+                else:
+                    print(f"  [{node.index}] {node.description}")
 
     def invoke(self):
         self.__build_call_graph()
         for node in ast.walk(self.tree):
             if isinstance(node, ast.Call) and self.LOCATE(node):
                 sink_info = self.__get_call_info(node)
-                print(f"Dangerous function call found: {sink_info['func']}")
                 print(f"Starting backward tracing from '{sink_info['func']}':")
                 self.TRACE(sink_info['func'], [sink_info['func']])
                 self.trace_variables_along_chain()
-                from pprint import pprint
-                pprint(self.variable_traces)        
                 self.print_variable_traces()
